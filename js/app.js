@@ -1,18 +1,20 @@
 /* Хайфский квиз — многопользовательская версия.
  *
- * Сеть: WebRTC через PeerJS. Ведущий открывает комнату с коротким кодом
- * (peer id = PREFIX + код) и хранит всё авторитетное состояние игры:
- * фазу, номер вопроса, игроков и их ответы. Игроки подключаются к ведущему
- * по коду / ссылке / QR, присылают имя и ответы, а получают снимок состояния.
+ * Сеть: публичный MQTT-брокер по WebSocket (wss). Все сообщения идут через брокер,
+ * прямых соединений между устройствами нет — поэтому работает в любой сети,
+ * где открываются сайты (Wi-Fi, мобильный интернет, разные сети у игроков).
  * Сервер не нужен — достаточно статического хостинга (например GitHub Pages).
  *
- * Протокол (JSON):
- *   игрок → ведущий: {t:"hello",pid,name}   {t:"answer",round,q,c,ms}
- *   ведущий → игрок: {t:"state",st,players,me:{answers}}
+ * Ведущий хранит всё авторитетное состояние игры: фазу, вопрос, игроков и их ответы.
+ * Топики (CODE — код комнаты, pid — постоянный id игрока):
+ *   TOPIC/CODE/up        игрок → ведущий: {t:"hello",pid,name} (раз в 5 с), {t:"answer",pid,round,q,c,ms}, {t:"bye",pid}
+ *   TOPIC/CODE/p/<pid>   ведущий → игрок: {t:"state",st,players,me:{answers}}
  */
 "use strict";
 
-const L=["А","Б","В","Г"], TL=30000, PREFIX="haifa-quiz-", NAME_MAX=24;
+const L=["А","Б","В","Г"], TL=30000, NAME_MAX=24;
+const TOPIC="haifa-quiz/v1/";
+const PING_MS=5000, OFFLINE_MS=16000, NOT_FOUND_MS=8000;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const ls={
@@ -21,21 +23,17 @@ const ls={
   del(k){try{localStorage.removeItem(k)}catch(e){}}
 };
 const rand=(n,abc)=>{let s="";const a=new Uint32Array(n);crypto.getRandomValues(a);for(const x of a)s+=abc[x%abc.length];return s;};
+const ID_ABC="abcdefghijklmnopqrstuvwxyz0123456789";
 const newCode=()=>rand(5,"ABCDEFGHJKLMNPQRSTUVWXYZ23456789");
-const newRound=()=>rand(6,"abcdefghijklmnopqrstuvwxyz0123456789");
+const newRound=()=>rand(6,ID_ABC);
 const normCode=s=>String(s||"").toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,8);
 
-/* Свой PeerJS-сервер: ?peer=host[:port][/path]. По умолчанию — публичный 0.peerjs.com. */
+/* Свой брокер: ?broker=wss://host:port/path. По умолчанию — публичный EMQX. */
 const params=new URLSearchParams(location.search);
-const PEER_OPTS=(()=>{
-  const o={debug:1};
-  const m=(params.get("peer")||"").match(/^([^:/]+)(?::(\d+))?(\/.*)?$/);
-  if(m){o.host=m[1];o.secure=location.protocol==="https:";o.port=+(m[2]||(o.secure?443:80));o.path=m[3]||"/";}
-  return o;
-})();
+const BROKER=params.get("broker")||"wss://broker.emqx.io:8084/mqtt";
 
 let role=null;        // null (стартовый экран) | "host" | "player"
-let peer=null;
+let client=null;      // MQTT-клиент
 let S=null;           // состояние игры {phase:"lobby"|"question"|"reveal"|"final", q, round, startedAt}
 let lastHTML="", lastView="";
 
@@ -45,30 +43,37 @@ function counted(i){return !!S&&(S.phase==="final"||i<S.q||(i===S.q&&S.phase==="
 function scoreOf(ans){return QS.reduce((s,_,i)=>s+(counted(i)?pts(i,ans):0),0);}
 function ranked(list){return list.slice().sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name));}
 
-/* ---------- статус соединения ---------- */
+/* ---------- связь ---------- */
 function setStatus(on,text){const s=$("#status");s.hidden=!text;s.classList.toggle("on",!!on);s.lastElementChild.textContent=text||"";}
-function showNote(t){const n=document.createElement("div");n.className="notice";n.textContent=t;$("#main").prepend(n);}
-function peerAvailable(){
-  if(window.Peer)return true;
-  $("#main").innerHTML=`<h1>Нет <em>связи</em></h1><div class="notice">Не удалось загрузить библиотеку PeerJS. Проверьте интернет и обновите страницу.</div>`;
+function libAvailable(){
+  if(window.mqtt)return true;
+  $("#main").innerHTML=`<h1>Нет <em>связи</em></h1><div class="notice">Не удалось загрузить сетевую библиотеку. Обновите страницу.</div>`;
   return false;
 }
+function connect(will){
+  const c=mqtt.connect(BROKER,{clientId:"hq_"+rand(12,ID_ABC),clean:true,keepalive:20,
+    reconnectPeriod:2000,connectTimeout:10000,will});
+  c.on("error",()=>{});
+  return c;
+}
+function publish(topic,msg){if(client&&client.connected)client.publish(topic,JSON.stringify(msg),{qos:1});}
+function parse(buf){try{const d=JSON.parse(buf.toString());return d&&typeof d==="object"?d:null}catch(e){return null}}
 function setRoomInURL(code){
   const u=new URL(location.href);
   if(code)u.searchParams.set("room",code);else u.searchParams.delete("room");
   history.replaceState(null,"",u);
 }
-function joinURL(code){const u=new URL(location.href);u.search="";u.hash="";u.searchParams.set("room",code);if(params.get("peer"))u.searchParams.set("peer",params.get("peer"));return u.toString();}
+function joinURL(code){const u=new URL(location.href);u.search="";u.hash="";u.searchParams.set("room",code);if(params.get("broker"))u.searchParams.set("broker",params.get("broker"));return u.toString();}
 
 /* =====================================================================
    ВЕДУЩИЙ
    ===================================================================== */
-const H={code:null,roster:{},conns:new Map(),opening:false};   // roster: pid -> {name,answers,online}
+const H={code:null,roster:{}};   // roster: pid -> {name,answers,online,seen}
 
 function hostSave(){ls.set("hq-host",{code:H.code,S,roster:H.roster});}
 
 function startHost(resume){
-  if(!peerAvailable())return;
+  if(!libAvailable())return;
   role="host";
   const saved=resume&&ls.get("hq-host",null);
   if(saved&&saved.code&&saved.S){
@@ -80,54 +85,38 @@ function startHost(resume){
   }
   setRoomInURL(null);
   $("#leave").hidden=false;
-  hostSave();openHostPeer(0);render();
-}
-
-function openHostPeer(attempt){
-  H.opening=true;
+  hostSave();
   setStatus(false,"Открываем комнату…");
-  const p=peer=new Peer(PREFIX+H.code,PEER_OPTS);
-  p.on("open",()=>{H.opening=false;setStatus(true,"Комната открыта");});
-  p.on("connection",hostAccept);
-  p.on("disconnected",()=>setStatus(false,"Нет связи с сервером…"));
-  p.on("error",e=>{
-    if(e.type==="unavailable-id"){
-      // Код ещё занят (например, ведущий только что перезагрузил страницу) — ждём, потом берём новый.
-      p.destroy();
-      if(attempt<3){setStatus(false,"Код занят, пробуем снова…");setTimeout(()=>openHostPeer(attempt+1),3000);}
-      else{H.code=newCode();hostSave();render();openHostPeer(0);}
-      return;
-    }
-    H.opening=false;
-    if(e.type==="browser-incompatible")showNote("Этот браузер не поддерживает WebRTC — откройте игру в Chrome, Safari или Firefox.");
-    else setStatus(false,"Нет связи с сервером…");
+  client=connect();
+  client.on("connect",()=>{
+    client.subscribe(TOPIC+H.code+"/up",{qos:1});
+    setStatus(true,"Комната открыта");
+    hostBroadcast();
   });
+  client.on("message",(t,buf)=>hostOnData(parse(buf)));
+  client.on("offline",()=>setStatus(false,"Нет связи с сервером…"));
+  client.on("reconnect",()=>setStatus(false,"Переподключаемся…"));
+  render();
 }
 
-function hostAccept(conn){
-  conn.on("data",d=>hostOnData(conn,d));
-  conn.on("close",()=>{
-    const pid=H.conns.get(conn);H.conns.delete(conn);
-    if(pid&&H.roster[pid]&&![...H.conns.values()].includes(pid)){H.roster[pid].online=false;hostChanged();}
-  });
-  conn.on("error",()=>{});
-}
-
-function hostOnData(conn,d){
-  if(!d||typeof d!=="object")return;
+function hostOnData(d){
+  if(!d||role!=="host")return;
+  const pid=typeof d.pid==="string"?d.pid.slice(0,64):"";
+  if(!pid)return;
+  const p=H.roster[pid];
   if(d.t==="hello"){
-    const pid=typeof d.pid==="string"?d.pid.slice(0,64):"";
     const name=typeof d.name==="string"?d.name.trim().slice(0,NAME_MAX):"";
-    if(!pid||!name)return;
-    const old=H.roster[pid];
-    H.roster[pid]={name,answers:(old&&old.answers)||{},online:true};
-    H.conns.set(conn,pid);
+    if(!name)return;
+    if(p&&p.online&&p.name===name){p.seen=Date.now();hostSend(pid);return;}
+    H.roster[pid]={name,answers:(p&&p.answers)||{},online:true,seen:Date.now()};
     hostChanged();
     return;
   }
+  if(d.t==="bye"){if(p&&p.online){p.online=false;hostChanged();}return;}
   if(d.t==="answer"){
-    const pid=H.conns.get(conn),p=pid&&H.roster[pid];
-    if(!p||!S||S.phase!=="question"||d.round!==S.round||d.q!==S.q||p.answers[S.q])return;
+    if(!p)return;
+    p.seen=Date.now();
+    if(!S||S.phase!=="question"||d.round!==S.round||d.q!==S.q||p.answers[S.q]){hostSend(pid);return;}
     const c=+d.c,elapsed=Date.now()-S.startedAt;
     if(!(c>=0&&c<4)||elapsed>TL+2000)return;
     // Время меряет телефон игрока (с момента показа вопроса), но не больше, чем прошло у ведущего.
@@ -137,6 +126,14 @@ function hostOnData(conn,d){
   }
 }
 
+/* Игрок, от которого давно нет сообщений, считается отключившимся. */
+setInterval(()=>{
+  if(role!=="host")return;
+  let changed=false;
+  for(const k in H.roster){const p=H.roster[k];if(p.online&&Date.now()-(p.seen||0)>OFFLINE_MS){p.online=false;changed=true;}}
+  if(changed)hostChanged();
+},2000);
+
 function hostPlayers(){
   return Object.entries(H.roster).map(([k,p])=>({k,name:p.name,online:p.online,answers:p.answers,
     done:!!(S&&p.answers[S.q]),score:scoreOf(p.answers)}));
@@ -145,9 +142,8 @@ function hostSnapshot(pid){
   const players=ranked(hostPlayers()).map(p=>({name:p.name,score:p.score,online:p.online,done:p.done,me:p.k===pid}));
   return {t:"state",st:S,players,me:{answers:(H.roster[pid]&&H.roster[pid].answers)||{}}};
 }
-function hostBroadcast(){
-  for(const [conn,pid] of H.conns){if(conn.open){try{conn.send(hostSnapshot(pid))}catch(e){}}}
-}
+function hostSend(pid){publish(TOPIC+H.code+"/p/"+pid,hostSnapshot(pid));}
+function hostBroadcast(){for(const pid in H.roster){if(H.roster[pid].online)hostSend(pid);}}
 function hostChanged(){hostSave();hostBroadcast();render();}
 function setState(patch){S=Object.assign({},S,patch);hostChanged();}
 
@@ -160,22 +156,22 @@ function hostReset(){
 }
 function hostClose(){
   if(!confirm("Закрыть комнату? Все игроки отключатся, результаты пропадут."))return;
-  if(peer)peer.destroy();
-  peer=null;H.conns.clear();ls.del("hq-host");
+  if(client)client.end(true);
+  client=null;ls.del("hq-host");
   goHome();
 }
 
 /* =====================================================================
    ИГРОК
    ===================================================================== */
-const P={code:null,pid:null,name:ls.get("hq-name",""),conn:null,connectingSince:0,notFound:false,
-  players:[],answers:{},pending:null};
+const P={code:null,pid:null,name:ls.get("hq-name",""),since:0,lastState:0,
+  players:[],answers:{},pending:null,timer:null};
 let seen=ls.get("hq-seen",{});    // "round:q" -> локальное время показа вопроса
 
 function startPlayer(code){
-  if(!peerAvailable())return;
+  if(!libAvailable())return;
   role="player";P.code=normCode(code);
-  P.pid=ls.get("hq-pid","")||rand(16,"abcdefghijklmnopqrstuvwxyz0123456789");ls.set("hq-pid",P.pid);
+  P.pid=ls.get("hq-pid","")||rand(16,ID_ABC);ls.set("hq-pid",P.pid);
   setRoomInURL(P.code);
   $("#leave").hidden=false;
   lastView="";
@@ -183,47 +179,49 @@ function startPlayer(code){
   render();
 }
 
+const upTopic=()=>TOPIC+P.code+"/up";
+function live(){return Date.now()-P.lastState<OFFLINE_MS;}
+
 function playerConnect(){
-  if(peer&&!peer.destroyed){if(peer.open)openConn();return;}
+  if(client)return;
   setStatus(false,"Подключаемся…");
-  const p=peer=new Peer(PEER_OPTS);
-  p.on("open",openConn);
-  p.on("disconnected",()=>setStatus(false,"Нет связи с сервером…"));
-  p.on("error",e=>{
-    P.connectingSince=0;
-    if(e.type==="peer-unavailable"){P.notFound=true;setStatus(false,"Комната не найдена");render();}
-    else if(e.type==="browser-incompatible")showNote("Этот браузер не поддерживает WebRTC — откройте игру в Chrome, Safari или Firefox.");
-    else setStatus(false,"Нет связи с сервером…");
-  });
-}
-
-function openConn(){
-  if(!peer||!peer.open||(P.conn&&P.conn.open)||P.connectingSince)return;
-  P.connectingSince=Date.now();
-  const c=peer.connect(PREFIX+P.code,{reliable:true,serialization:"json"});
-  c.on("open",()=>{
-    P.conn=c;P.connectingSince=0;P.notFound=false;
-    setStatus(true,"В комнате "+P.code);
+  P.since=Date.now();
+  client=connect({topic:upTopic(),payload:JSON.stringify({t:"bye",pid:P.pid}),qos:1,retain:false});
+  client.on("connect",()=>{
+    client.subscribe(TOPIC+P.code+"/p/"+P.pid,{qos:1});
+    P.since=Date.now();
     sendHello();
-    if(P.pending)c.send(Object.assign({t:"answer"},P.pending));
-    render();
   });
-  c.on("data",playerOnData);
-  c.on("close",()=>{if(P.conn===c)P.conn=null;P.connectingSince=0;if(role==="player")setStatus(false,"Переподключаемся…");render();});
-  c.on("error",()=>{P.connectingSince=0;});
+  client.on("message",(t,buf)=>playerOnData(parse(buf)));
+  client.on("offline",()=>{setStatus(false,"Нет связи с сервером…");render();});
+  client.on("reconnect",()=>setStatus(false,"Переподключаемся…"));
+  clearInterval(P.timer);
+  P.timer=setInterval(()=>{sendHello();updatePlayerStatus();render();},PING_MS);
 }
 
-function sendHello(){if(P.conn&&P.conn.open&&P.name)P.conn.send({t:"hello",pid:P.pid,name:P.name});}
+function sendHello(){
+  if(!P.name)return;
+  publish(upTopic(),{t:"hello",pid:P.pid,name:P.name});
+  if(P.pending)publish(upTopic(),Object.assign({t:"answer",pid:P.pid},P.pending));
+}
+
+function updatePlayerStatus(){
+  if(!client||!client.connected)return;
+  if(live())setStatus(true,"В комнате "+P.code);
+  else if(Date.now()-P.since>NOT_FOUND_MS)setStatus(false,"Ведущий не в сети");
+  else setStatus(false,"Ищем комнату…");
+}
 
 function playerOnData(d){
-  if(!d||d.t!=="state"||!d.st||typeof d.st.phase!=="string")return;
+  if(!d||role!=="player"||d.t!=="state"||!d.st||typeof d.st.phase!=="string")return;
   const st=d.st;
   if(!(Number.isInteger(st.q)&&st.q>=0&&st.q<QS.length))return;
-  S=st;
+  S=st;P.lastState=Date.now();
   P.players=Array.isArray(d.players)?d.players:[];
   P.answers=(d.me&&d.me.answers)||{};
   if(P.pending&&(P.pending.round!==S.round||P.pending.q!==S.q||P.answers[S.q]))P.pending=null;
   if(S.phase==="question"){const k=S.round+":"+S.q;if(!seen[k]){seen[k]=Date.now();ls.set("hq-seen",seen);}}
+  updatePlayerStatus();
   render();
 }
 
@@ -237,7 +235,7 @@ function myAnswer(){
 function join(name){
   name=(name||"").trim().slice(0,NAME_MAX);if(!name)return;
   P.name=name;ls.set("hq-name",name);lastView="";
-  if(P.conn&&P.conn.open)sendHello();else playerConnect();
+  if(client)sendHello();else playerConnect();
   render();
 }
 
@@ -246,30 +244,17 @@ function answer(i){
   const ms=Math.min(TL,Date.now()-(seen[S.round+":"+S.q]||Date.now()));
   if(ms>=TL)return;
   P.pending={round:S.round,q:S.q,c:i,ms};
-  if(P.conn&&P.conn.open)P.conn.send(Object.assign({t:"answer"},P.pending));
+  publish(upTopic(),Object.assign({t:"answer",pid:P.pid},P.pending));
   render();
 }
 
 function playerLeave(){
-  if(P.conn)P.conn.close();
-  if(peer)peer.destroy();
-  peer=null;P.conn=null;P.pending=null;S=null;
+  publish(upTopic(),{t:"bye",pid:P.pid});
+  clearInterval(P.timer);
+  if(client)client.end();
+  client=null;P.pending=null;P.lastState=0;S=null;
   goHome();
 }
-
-/* ---------- сторож соединения: переподключение игрока и ведущего ---------- */
-setInterval(()=>{
-  if(role==="host"&&peer&&!H.opening){
-    if(peer.destroyed)openHostPeer(0);
-    else if(peer.disconnected)peer.reconnect();
-  }
-  if(role==="player"&&P.name){
-    if(P.connectingSince&&Date.now()-P.connectingSince>8000)P.connectingSince=0;
-    if(!peer||peer.destroyed)playerConnect();
-    else if(peer.disconnected)peer.reconnect();
-    else openConn();
-  }
-},3000);
 
 /* =====================================================================
    ОТРИСОВКА
@@ -386,10 +371,11 @@ function renderPlayer(){
   }
   lastView="player";
   const ps=P.players,mine=ps.find(p=>p.me);
-  if(!S||!(P.conn&&P.conn.open)&&S.phase==="lobby"){
+  if(!S||!live()&&S.phase==="lobby"){
+    const lost=client&&client.connected&&Date.now()-P.since>NOT_FOUND_MS;
     if(setHTML(`<span class="eyebrow">Привет, ${esc(P.name)} · комната ${esc(P.code)}</span>
       <h1>Ждём <em>ведущего</em></h1>
-      <p class="muted">${P.notFound?"Комната с таким кодом пока не открыта. Проверьте код — мы продолжаем пытаться подключиться.":"Подключаемся к комнате…"}</p>
+      <p class="muted">${lost?"Комната с таким кодом сейчас не отвечает. Проверьте код и что у ведущего открыта игра — мы продолжаем пытаться.":"Подключаемся к комнате…"}</p>
       <div class="row"><button class="btn ghost" id="rn">Сменить имя</button></div>`))bindRename();
     return;
   }
