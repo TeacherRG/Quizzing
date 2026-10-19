@@ -9,11 +9,14 @@
  * Топики (CODE — код комнаты, pid — постоянный id игрока):
  *   TOPIC/CODE/up        игрок → ведущий: {t:"hello",pid,name} (раз в 5 с), {t:"answer",pid,round,q,c,ms}, {t:"bye",pid}
  *   TOPIC/CODE/p/<pid>   ведущий → игрок: {t:"state",st,players,me:{answers}}
+ *
+ * Тексты в коде не живут: надписи интерфейса — data/texts.json,
+ * квизы — data/quizzes/<id>.json, их список — data/quizzes/index.json.
  */
 "use strict";
 
-const VERSION=4;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
-const L=["А","Б","В","Г"], TL=30000, NAME_MAX=24;
+const VERSION=5;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
+const TL=30000, NAME_MAX=24;
 const TOPIC="haifa-quiz/v1/";
 const PING_MS=5000, OFFLINE_MS=16000, NOT_FOUND_MS=8000;
 const $=s=>document.querySelector(s);
@@ -38,17 +41,49 @@ let client=null;      // MQTT-клиент
 let S=null;           // состояние игры {phase:"lobby"|"question"|"reveal"|"final", q, round, startedAt}
 let lastHTML="", lastView="";
 
-/* ---------- выбор квиза (QUIZZES — в questions.js) ---------- */
+/* ---------- тексты и квизы из data/*.json ---------- */
+let T={};                       // data/texts.json
+let QUIZZES={}, DEFAULT_QUIZ=""; // id -> квиз из data/quizzes/<id>.json
 let QUIZ=null, QS=[];
+
+/* Строка интерфейса по ключу "раздел.ключ". t() — для HTML (подстановки экранируются), tp() — простой текст. */
+function lookup(key){const v=key.split(".").reduce((o,k)=>o&&o[k],T);return typeof v==="string"?v:key;}
+function tp(key,vars){return lookup(key).replace(/\{(\w+)\}/g,(m,k)=>vars&&k in vars?String(vars[k]):m);}
+function t(key,vars){return lookup(key).replace(/\{(\w+)\}/g,(m,k)=>vars&&k in vars?esc(vars[k]):m);}
+const letter=i=>(T.app&&T.app.letters||["A","B","C","D"])[i];
+
+async function loadJSON(path){
+  const r=await fetch(path+"?v="+VERSION);
+  if(!r.ok)throw new Error(path+": HTTP "+r.status);
+  return r.json();
+}
+function validQuestion(q){
+  return q&&typeof q.question==="string"&&Array.isArray(q.options)&&q.options.length===4&&
+    q.options.every(o=>typeof o==="string")&&Number.isInteger(q.answer)&&q.answer>=0&&q.answer<4;
+}
+async function loadData(){
+  const [texts,index]=await Promise.all([loadJSON("data/texts.json"),loadJSON("data/quizzes/index.json")]);
+  T=texts;
+  const ids=Array.isArray(index.quizzes)?index.quizzes:[];
+  const quizzes=await Promise.all(ids.map(id=>loadJSON("data/quizzes/"+id+".json")));
+  ids.forEach((id,i)=>{
+    const z=quizzes[i];
+    const qs=(z.questions||[]).filter(q=>{const ok=validQuestion(q);if(!ok)console.warn("Пропущен неверный вопрос в "+id+".json",q);return ok;});
+    if(qs.length)QUIZZES[id]=Object.assign({},z,{questions:qs});
+  });
+  DEFAULT_QUIZ=QUIZZES[index.default]?index.default:Object.keys(QUIZZES)[0];
+  if(!DEFAULT_QUIZ)throw new Error("нет ни одного квиза");
+}
+
 function useQuiz(id){
-  QUIZ=QUIZZES[id]||QUIZZES.haifa;QS=QUIZ.qs;
+  QUIZ=QUIZZES[id]||QUIZZES[DEFAULT_QUIZ];QS=QUIZ.questions;
   $("#brand").textContent=QUIZ.brand;
   document.title=QUIZ.brand;
 }
-function quizId(){for(const k in QUIZZES)if(QUIZZES[k]===QUIZ)return k;return "haifa";}
+function quizId(){for(const k in QUIZZES)if(QUIZZES[k]===QUIZ)return k;return DEFAULT_QUIZ;}
 
 /* ---------- очки ---------- */
-function pts(i,ans){const a=ans&&ans[i];if(!a||a[0]!==QS[i].a)return 0;return 500+Math.round(500*Math.max(0,1-a[1]/TL));}
+function pts(i,ans){const a=ans&&ans[i];if(!a||a[0]!==QS[i].answer)return 0;return 500+Math.round(500*Math.max(0,1-a[1]/TL));}
 function counted(i){return !!S&&(S.phase==="final"||i<S.q||(i===S.q&&S.phase==="reveal"));}
 function scoreOf(ans){return QS.reduce((s,_,i)=>s+(counted(i)?pts(i,ans):0),0);}
 function ranked(list){return list.slice().sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name));}
@@ -57,7 +92,7 @@ function ranked(list){return list.slice().sort((a,b)=>b.score-a.score||a.name.lo
 function setStatus(on,text){const s=$("#status");s.hidden=!text;s.classList.toggle("on",!!on);s.lastElementChild.textContent=text||"";}
 function libAvailable(){
   if(window.mqtt)return true;
-  $("#main").innerHTML=`<h1>Нет <em>связи</em></h1><div class="notice">Не удалось загрузить сетевую библиотеку. Обновите страницу.</div>`;
+  $("#main").innerHTML=`<h1>${t("app.netErrorTitle")}</h1><div class="notice">${t("app.netError")}</div>`;
   return false;
 }
 function connect(will){
@@ -91,22 +126,22 @@ function startHost(resume){
     for(const k in H.roster)H.roster[k].online=false;
   }else{
     H.code=newCode();H.roster={};
-    S={phase:"lobby",q:0,round:newRound(),startedAt:0,quiz:ls.get("hq-quiz","haifa")};
+    S={phase:"lobby",q:0,round:newRound(),startedAt:0,quiz:ls.get("hq-quiz",DEFAULT_QUIZ)};
   }
   useQuiz(S.quiz);
   setRoomInURL(null);
   $("#leave").hidden=false;
   hostSave();
-  setStatus(false,"Открываем комнату…");
+  setStatus(false,tp("status.opening"));
   client=connect();
   client.on("connect",()=>{
     client.subscribe(TOPIC+H.code+"/up",{qos:1});
-    setStatus(true,"Комната открыта");
+    setStatus(true,tp("status.open"));
     hostBroadcast();
   });
-  client.on("message",(t,buf)=>hostOnData(parse(buf)));
-  client.on("offline",()=>setStatus(false,"Нет связи с сервером…"));
-  client.on("reconnect",()=>setStatus(false,"Переподключаемся…"));
+  client.on("message",(topic,buf)=>hostOnData(parse(buf)));
+  client.on("offline",()=>setStatus(false,tp("status.offline")));
+  client.on("reconnect",()=>setStatus(false,tp("status.reconnecting")));
   render();
 }
 
@@ -167,7 +202,7 @@ function hostReset(){
   setState({phase:"lobby",q:0,round:newRound(),startedAt:0});
 }
 function hostClose(){
-  if(!confirm("Закрыть комнату? Все игроки отключатся, результаты пропадут."))return;
+  if(!confirm(tp("lobby.confirmClose")))return;
   if(client)client.end(true);
   client=null;ls.del("hq-host");
   goHome();
@@ -196,7 +231,7 @@ function live(){return Date.now()-P.lastState<OFFLINE_MS;}
 
 function playerConnect(){
   if(client)return;
-  setStatus(false,"Подключаемся…");
+  setStatus(false,tp("status.connecting"));
   P.since=Date.now();
   client=connect({topic:upTopic(),payload:JSON.stringify({t:"bye",pid:P.pid}),qos:1,retain:false});
   client.on("connect",()=>{
@@ -204,9 +239,9 @@ function playerConnect(){
     P.since=Date.now();
     sendHello();
   });
-  client.on("message",(t,buf)=>playerOnData(parse(buf)));
-  client.on("offline",()=>{setStatus(false,"Нет связи с сервером…");render();});
-  client.on("reconnect",()=>setStatus(false,"Переподключаемся…"));
+  client.on("message",(topic,buf)=>playerOnData(parse(buf)));
+  client.on("offline",()=>{setStatus(false,tp("status.offline"));render();});
+  client.on("reconnect",()=>setStatus(false,tp("status.reconnecting")));
   clearInterval(P.timer);
   P.timer=setInterval(()=>{sendHello();updatePlayerStatus();render();},PING_MS);
 }
@@ -219,16 +254,16 @@ function sendHello(){
 
 function updatePlayerStatus(){
   if(!client||!client.connected)return;
-  if(live()&&P.hostVersion!==VERSION)setStatus(false,"У ведущего другая версия — обновите страницы");
-  else if(live())setStatus(true,"В комнате "+P.code);
-  else if(Date.now()-P.since>NOT_FOUND_MS)setStatus(false,"Ведущий не в сети");
-  else setStatus(false,"Ищем комнату…");
+  if(live()&&P.hostVersion!==VERSION)setStatus(false,tp("status.versionMismatch"));
+  else if(live())setStatus(true,tp("status.inRoom",{code:P.code}));
+  else if(Date.now()-P.since>NOT_FOUND_MS)setStatus(false,tp("status.hostOffline"));
+  else setStatus(false,tp("status.searching"));
 }
 
 function playerOnData(d){
   if(!d||role!=="player"||d.t!=="state"||!d.st||typeof d.st.phase!=="string")return;
   const st=d.st;
-  const qs=(QUIZZES[st.quiz]||QUIZZES.haifa).qs;
+  const qs=(QUIZZES[st.quiz]||QUIZZES[DEFAULT_QUIZ]).questions;
   if(!(Number.isInteger(st.q)&&st.q>=0&&st.q<qs.length))return;
   useQuiz(st.quiz);
   S=st;P.lastState=Date.now();
@@ -288,20 +323,21 @@ function render(){
 function renderHome(){
   if(lastView==="home")return;lastView="home";lastHTML="";
   const saved=ls.get("hq-host",null);
-  $("#brand").textContent="Семейный Квиз";document.title="Семейный Квиз";
-  $("#main").innerHTML=`<span class="eyebrow">${Object.values(QUIZZES).map(z=>esc(z.name)).join(" · ")} · по 12 вопросов</span>
-    <h1>Семейный <em>квиз</em></h1>
-    <p class="muted">Ведущий открывает игру на большом экране, игроки отвечают с телефонов.</p>
+  $("#brand").textContent=tp("app.brand");document.title=tp("app.brand");
+  const zs=Object.values(QUIZZES);
+  $("#main").innerHTML=`<span class="eyebrow">${t("home.eyebrow",{quizzes:zs.map(z=>z.name).join(" · "),count:zs[0].questions.length})}</span>
+    <h1>${t("home.title")}</h1>
+    <p class="muted">${t("home.intro")}</p>
     <div class="choice">
-      <div class="panel"><span class="eyebrow">Я ведущий</span>
-        <p class="muted">Создайте комнату, выберите квиз и покажите код или QR игрокам.</p>
-        <button class="btn" id="host-new">Создать комнату</button>
-        ${saved&&saved.code?`<button class="btn ghost" id="host-resume">Вернуться в комнату ${esc(saved.code)}</button>`:""}
+      <div class="panel"><span class="eyebrow">${t("home.hostLabel")}</span>
+        <p class="muted">${t("home.hostText")}</p>
+        <button class="btn" id="host-new">${t("home.hostNew")}</button>
+        ${saved&&saved.code?`<button class="btn ghost" id="host-resume">${t("home.hostResume",{code:saved.code})}</button>`:""}
       </div>
-      <form class="panel" id="cf"><span class="eyebrow">Я игрок</span>
-        <label for="code" class="muted">Код комнаты с экрана ведущего</label>
-        <input id="code" maxlength="8" autocomplete="off" autocapitalize="characters" placeholder="Например, K7QXM">
-        <button class="btn" type="submit">Войти</button>
+      <form class="panel" id="cf"><span class="eyebrow">${t("home.playerLabel")}</span>
+        <label for="code" class="muted">${t("home.codeLabel")}</label>
+        <input id="code" maxlength="8" autocomplete="off" autocapitalize="characters" placeholder="${t("home.codePlaceholder")}">
+        <button class="btn" type="submit">${t("home.join")}</button>
       </form>
     </div>`;
   $("#host-new").onclick=()=>startHost(false);
@@ -313,9 +349,9 @@ function boardHTML(list,max){
   return '<div class="board">'+list.slice(0,max).map(p=>`<div class="${p.me?"me":""}"><span>${esc(p.name)}</span><span class="pts">${p.score}</span></div>`).join("")+'</div>';
 }
 function finalHTML(ps){
-  const t=ps.slice(0,3);
-  return `<span class="eyebrow">${esc(QUIZ.finale)}</span><h1>Итоги <em>квиза</em></h1>
-    ${t.length?`<div class="podium">${[1,0,2].map(i=>t[i]?`<div class="p${i+1}"><strong>${i+1}</strong>${esc(t[i].name)}<div class="muted">${t[i].score}</div></div>`:"<span></span>").join("")}</div>`+boardHTML(ps,50)
+  const top=ps.slice(0,3);
+  return `<span class="eyebrow">${esc(QUIZ.finale)}</span><h1>${t("final.title")}</h1>
+    ${top.length?`<div class="podium">${[1,0,2].map(i=>top[i]?`<div class="p${i+1}"><strong>${i+1}</strong>${esc(top[i].name)}<div class="muted">${top[i].score}</div></div>`:"<span></span>").join("")}</div>`+boardHTML(ps,50)
       :`<p class="muted">${esc(QUIZ.empty)}</p>`}`;
 }
 function timeLeft(){
@@ -330,22 +366,22 @@ function renderHost(){
   if(S.phase==="lobby"){
     const url=joinURL(H.code);
     const id=quizId();
-    if(setHTML(`<span class="eyebrow">Лобби · ${esc(QUIZ.eyebrow)}</span>
+    if(setHTML(`<span class="eyebrow">${t("lobby.eyebrow",{eyebrow:QUIZ.eyebrow})}</span>
       <h1>${QUIZ.title}</h1>
-      <div class="row"><span class="muted">Квиз:</span><div class="seg" id="quiz">${Object.entries(QUIZZES).map(([k,z])=>
+      <div class="row"><span class="muted">${t("lobby.quiz")}</span><div class="seg" id="quiz">${Object.entries(QUIZZES).map(([k,z])=>
         `<button type="button" data-q="${k}" aria-pressed="${k===id}">${esc(z.name)}</button>`).join("")}</div></div>
       <div class="panel invite">
-        <div id="qr" aria-label="QR-код для входа"></div>
+        <div id="qr" aria-label="${t("lobby.qrLabel")}"></div>
         <div style="display:flex;flex-direction:column;gap:8px;min-width:0">
-          <span class="eyebrow">Код комнаты</span><span class="code">${esc(H.code)}</span>
-          <span class="muted">Отсканируйте QR или откройте ссылку:</span><span class="link">${esc(url)}</span>
+          <span class="eyebrow">${t("lobby.code")}</span><span class="code">${esc(H.code)}</span>
+          <span class="muted">${t("lobby.scan")}</span><span class="link">${esc(url)}</span>
         </div>
       </div>
-      <div class="notice">Не закрывайте и не сворачивайте эту вкладку: через неё идёт игра. Ссылку удобнее показать QR-кодом.</div>
-      <p class="muted">12 вопросов, по 30 секунд. Правильный ответ даёт 500 очков и до 500 бонусных за скорость.</p>
-      <div class="panel"><div class="meta"><span>Игроки в комнате</span><span>${online.length}</span></div>
-        <div class="chips" style="margin-top:12px">${ps.length?ps.map(p=>`<span class="chip ${p.online?"":"off"}">${esc(p.name)}</span>`).join(""):'<span class="muted">Пока никого. Первый, кто зайдёт, появится здесь.</span>'}</div></div>
-      <div class="row"><button class="btn" id="go">Начать игру</button><button class="btn ghost" id="cl">Закрыть комнату</button></div>`)){
+      <div class="notice">${t("lobby.keepOpen")}</div>
+      <p class="muted">${t("lobby.rules",{count:QS.length,seconds:TL/1000})}</p>
+      <div class="panel"><div class="meta"><span>${t("lobby.players")}</span><span>${online.length}</span></div>
+        <div class="chips" style="margin-top:12px">${ps.length?ps.map(p=>`<span class="chip ${p.online?"":"off"}">${esc(p.name)}</span>`).join(""):`<span class="muted">${t("lobby.nobody")}</span>`}</div></div>
+      <div class="row"><button class="btn" id="go">${t("lobby.start")}</button><button class="btn ghost" id="cl">${t("lobby.close")}</button></div>`)){
       $("#go").onclick=hostStart;$("#cl").onclick=hostClose;
       $("#quiz").querySelectorAll("button").forEach(b=>b.onclick=()=>hostPickQuiz(b.dataset.q));
       if(window.QRCode)new QRCode($("#qr"),{text:url,width:160,height:160,correctLevel:QRCode.CorrectLevel.M});
@@ -354,7 +390,7 @@ function renderHost(){
     return;
   }
   if(S.phase==="final"){
-    if(setHTML(finalHTML(ps)+`<div class="row"><button class="btn" id="again">Новая игра</button><button class="btn ghost" id="cl">Закрыть комнату</button></div>`)){
+    if(setHTML(finalHTML(ps)+`<div class="row"><button class="btn" id="again">${t("final.again")}</button><button class="btn ghost" id="cl">${t("lobby.close")}</button></div>`)){
       $("#again").onclick=hostReset;$("#cl").onclick=hostClose;
     }
     return;
@@ -362,17 +398,18 @@ function renderHost(){
   const Q=QS[S.q],rev=S.phase==="reveal";
   const cnt=[0,0,0,0];ps.forEach(p=>{const a=p.answers[S.q];if(a)cnt[a[0]]++;});
   const answered=ps.filter(p=>p.done).length;
-  if(setHTML(`<div class="meta"><span>Вопрос ${S.q+1} из ${QS.length} · ${S.q<6?"Раунд 1":"Раунд 2 · "+esc(QUIZ.round2)}</span><span>${rev?"":"Ответили: "+answered+" из "+online.length}</span></div>
+  const round=S.q<Math.ceil(QS.length/2)?t("game.round1"):t("game.round2",{name:QUIZ.round2});
+  if(setHTML(`<div class="meta"><span>${t("game.progress",{n:S.q+1,total:QS.length})} · ${round}</span><span>${rev?"":t("game.answered",{n:answered,total:online.length})}</span></div>
     ${rev?"":'<div class="bar"><i id="tb"></i></div>'}
-    <h2>${esc(Q.q)}</h2>
-    <div class="grid host">${Q.o.map((o,i)=>`<div class="tile t${i} ${rev?(i===Q.a?"right":"dim"):""}"><b>${L[i]}</b><span>${esc(o)}</span>${rev?`<span class="cnt">${cnt[i]}</span>`:""}</div>`).join("")}</div>
-    ${rev?`<div class="why"><span class="eyebrow">Ключ ведущего</span><p>${L[Q.a]}. ${esc(Q.why)}</p></div>
-      ${ps.length?`<span class="eyebrow">Таблица лидеров</span>`+boardHTML(ps,5):""}
-      <div class="row"><button class="btn" id="nx">${S.q+1<QS.length?"Следующий вопрос":"Итоги игры"}</button></div>`
-     :`<div class="row"><button class="btn" id="rv">Показать ответ</button><span class="muted big" id="tn" style="font-size:32px"></span></div>`}
-    <div class="row"><button class="btn ghost" id="rs">Начать заново</button></div>`)){
+    <h2>${esc(Q.question)}</h2>
+    <div class="grid host">${Q.options.map((o,i)=>`<div class="tile t${i} ${rev?(i===Q.answer?"right":"dim"):""}"><b>${letter(i)}</b><span>${esc(o)}</span>${rev?`<span class="cnt">${cnt[i]}</span>`:""}</div>`).join("")}</div>
+    ${rev?`<div class="why"><span class="eyebrow">${t("game.key")}</span><p>${letter(Q.answer)}. ${esc(Q.explanation||"")}</p></div>
+      ${ps.length?`<span class="eyebrow">${t("game.leaders")}</span>`+boardHTML(ps,5):""}
+      <div class="row"><button class="btn" id="nx">${S.q+1<QS.length?t("game.next"):t("game.results")}</button></div>`
+     :`<div class="row"><button class="btn" id="rv">${t("game.reveal")}</button><span class="muted big" id="tn" style="font-size:32px"></span></div>`}
+    <div class="row"><button class="btn ghost" id="rs">${t("game.restart")}</button></div>`)){
     if(rev)$("#nx").onclick=hostNext;else $("#rv").onclick=hostReveal;
-    $("#rs").onclick=()=>{if(confirm("Начать игру заново? Очки обнулятся."))hostReset();};
+    $("#rs").onclick=()=>{if(confirm(tp("game.confirmRestart")))hostReset();};
   }
   tick();
 }
@@ -381,13 +418,14 @@ function renderPlayer(){
   const m=$("#main");
   if(!P.name){
     if(lastView==="join")return;lastView="join";lastHTML="";
-    m.innerHTML=`<span class="eyebrow">Комната ${esc(P.code)}</span>
-      <h1>${QUIZ?QUIZ.title:"Семейный <em>квиз</em>"}</h1>
-      <p class="muted">Как тебя записать в таблицу лидеров?</p>
+    const z=QUIZ||QUIZZES[DEFAULT_QUIZ];
+    m.innerHTML=`<span class="eyebrow">${t("player.room",{code:P.code})}</span>
+      <h1>${QUIZ?QUIZ.title:t("home.title")}</h1>
+      <p class="muted">${t("player.askName")}</p>
       <form id="jf" class="row" style="flex-direction:column;align-items:stretch;max-width:420px">
-        <label for="nm" class="eyebrow">Имя или ник</label>
-        <input id="nm" maxlength="${NAME_MAX}" autocomplete="nickname" placeholder="${esc(QUIZ?QUIZ.placeholder:"Например, Кабан из Адара")}">
-        <button class="btn" type="submit">Войти в игру</button></form>`;
+        <label for="nm" class="eyebrow">${t("player.nameLabel")}</label>
+        <input id="nm" maxlength="${NAME_MAX}" autocomplete="nickname" placeholder="${esc(z.placeholder||"")}">
+        <button class="btn" type="submit">${t("player.joinGame")}</button></form>`;
     $("#jf").addEventListener("submit",e=>{e.preventDefault();join($("#nm").value)});
     return;
   }
@@ -395,33 +433,33 @@ function renderPlayer(){
   const ps=P.players,mine=ps.find(p=>p.me);
   if(!S||!live()&&S.phase==="lobby"){
     const lost=client&&client.connected&&Date.now()-P.since>NOT_FOUND_MS;
-    if(setHTML(`<span class="eyebrow">Привет, ${esc(P.name)} · комната ${esc(P.code)}</span>
-      <h1>Ждём <em>ведущего</em></h1>
-      <p class="muted">${lost?"Комната с таким кодом сейчас не отвечает. Проверьте код и что у ведущего открыта игра — мы продолжаем пытаться.":"Подключаемся к комнате…"}</p>
-      <div class="row"><button class="btn ghost" id="rn">Сменить имя</button></div>`))bindRename();
+    if(setHTML(`<span class="eyebrow">${t("player.hello",{name:P.name,code:P.code})}</span>
+      <h1>${t("player.waitHost")}</h1>
+      <p class="muted">${lost?t("player.notFound"):t("player.connecting")}</p>
+      <div class="row"><button class="btn ghost" id="rn">${t("player.rename")}</button></div>`))bindRename();
     return;
   }
   if(S.phase==="lobby"){
-    if(setHTML(`<span class="eyebrow">Ты в игре · ${esc(QUIZ.name)} · комната ${esc(P.code)}</span><h1>${esc(P.name)}, <em>сядь поудобнее</em></h1>
-      <p class="muted">Вопросы появятся, когда ведущий начнёт.</p>
+    if(setHTML(`<span class="eyebrow">${t("player.inGame",{quiz:QUIZ.name,code:P.code})}</span><h1>${t("player.sitDown",{name:P.name})}</h1>
+      <p class="muted">${t("player.waitStart")}</p>
       <div class="chips">${ps.filter(p=>p.online).map(p=>`<span class="chip ${p.me?"me":""}">${esc(p.name)}</span>`).join("")}</div>
-      <div class="row"><button class="btn ghost" id="rn">Сменить имя</button></div>`))bindRename();
+      <div class="row"><button class="btn ghost" id="rn">${t("player.rename")}</button></div>`))bindRename();
     return;
   }
   if(S.phase==="final"){setHTML(finalHTML(ps));return;}
   const Q=QS[S.q],my=myAnswer(),rev=S.phase==="reveal";
   if(rev){
-    const ok=my&&my[0]===Q.a,place=ps.findIndex(p=>p.me)+1;
-    setHTML(`<div class="meta"><span>Вопрос ${S.q+1} из ${QS.length}</span><span>${mine?mine.score:0} очков</span></div>
-      <div class="big ${ok?"ok":"bad"}">${ok?"+"+pts(S.q,P.answers):(my?"Мимо":"Без ответа")}</div>
-      <p>Правильно: <b>${L[Q.a]}. ${esc(Q.o[Q.a])}</b></p>
-      ${place?`<p class="muted">Ты на ${place}-м месте из ${ps.length}.</p>`:""}`);
+    const ok=my&&my[0]===Q.answer,place=ps.findIndex(p=>p.me)+1;
+    setHTML(`<div class="meta"><span>${t("game.progress",{n:S.q+1,total:QS.length})}</span><span>${t("player.points",{n:mine?mine.score:0})}</span></div>
+      <div class="big ${ok?"ok":"bad"}">${ok?"+"+pts(S.q,P.answers):(my?t("player.miss"):t("player.noAnswer"))}</div>
+      <p>${t("player.correct",{letter:letter(Q.answer),text:Q.options[Q.answer]})}</p>
+      ${place?`<p class="muted">${t("player.place",{place,total:ps.length})}</p>`:""}`);
     return;
   }
-  if(setHTML(`<div class="meta"><span>Вопрос ${S.q+1} из ${QS.length}</span><span id="tn"></span></div><div class="bar"><i id="tb"></i></div>
-    <p style="font-weight:800;font-size:18px">${esc(Q.q)}</p>
-    <div class="grid player">${Q.o.map((o,i)=>my?`<div class="tile t${i} ${my[0]===i?"picked":"dim"}"><b>${L[i]}</b><span>${esc(o)}</span></div>`:`<button type="button" class="tile t${i}" data-i="${i}"><b>${L[i]}</b><span>${esc(o)}</span></button>`).join("")}</div>
-    ${my?'<p class="muted">Ответ принят. Ждём, пока ведущий откроет правильный.</p>':""}`)){
+  if(setHTML(`<div class="meta"><span>${t("game.progress",{n:S.q+1,total:QS.length})}</span><span id="tn"></span></div><div class="bar"><i id="tb"></i></div>
+    <p style="font-weight:800;font-size:18px">${esc(Q.question)}</p>
+    <div class="grid player">${Q.options.map((o,i)=>my?`<div class="tile t${i} ${my[0]===i?"picked":"dim"}"><b>${letter(i)}</b><span>${esc(o)}</span></div>`:`<button type="button" class="tile t${i}" data-i="${i}"><b>${letter(i)}</b><span>${esc(o)}</span></button>`).join("")}</div>
+    ${my?`<p class="muted">${t("player.accepted")}</p>`:""}`)){
     $("#main").querySelectorAll("button.tile").forEach(b=>b.onclick=()=>answer(+b.dataset.i));
   }
   tick();
@@ -431,7 +469,7 @@ function bindRename(){const b=$("#rn");if(b)b.onclick=()=>{P.name="";lastView=""
 function tick(){
   const left=timeLeft(),tb=$("#tb"),tn=$("#tn");
   if(tb)tb.style.width=(left/TL*100)+"%";
-  if(tn)tn.textContent=S&&S.phase==="question"?Math.ceil(left/1000)+" c":"";
+  if(tn)tn.textContent=S&&S.phase==="question"?tp("app.seconds",{n:Math.ceil(left/1000)}):"";
   if(role==="host"&&S&&S.phase==="question"){
     const online=hostPlayers().filter(p=>p.online);
     if(left<=0||(online.length>0&&online.every(p=>p.done)))hostReveal();
@@ -440,7 +478,7 @@ function tick(){
 setInterval(tick,250);
 
 /* ---------- старт ---------- */
-$("#ver").textContent="Версия "+VERSION;
+$("#ver").textContent="v"+VERSION;
 /* Свёрнутая вкладка теряет соединение — при возврате переподключаемся сразу. */
 document.addEventListener("visibilitychange",()=>{
   if(document.visibilityState!=="visible"||!client)return;
@@ -448,5 +486,12 @@ document.addEventListener("visibilitychange",()=>{
   if(role==="player")sendHello();
 });
 $("#leave").onclick=()=>{if(role==="host")hostClose();else if(role==="player")playerLeave();};
-if(params.get("room"))startPlayer(params.get("room"));
-else render();
+loadData().then(()=>{
+  $("#ver").textContent=tp("app.version",{v:VERSION});
+  if(params.get("room"))startPlayer(params.get("room"));
+  else render();
+},e=>{
+  console.error(e);
+  // texts.json мог не загрузиться — поэтому это единственная строка, написанная прямо в коде.
+  $("#main").innerHTML=`<h1>Ошибка <em>загрузки</em></h1><div class="notice">${T.app?t("app.loadError"):"Не удалось загрузить файлы игры (data/*.json). Обновите страницу."}</div>`;
+});
