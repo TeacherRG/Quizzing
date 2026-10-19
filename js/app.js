@@ -12,6 +12,7 @@
  */
 "use strict";
 
+const VERSION=3;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
 const L=["А","Б","В","Г"], TL=30000, NAME_MAX=24;
 const TOPIC="haifa-quiz/v1/";
 const PING_MS=5000, OFFLINE_MS=16000, NOT_FOUND_MS=8000;
@@ -140,7 +141,7 @@ function hostPlayers(){
 }
 function hostSnapshot(pid){
   const players=ranked(hostPlayers()).map(p=>({name:p.name,score:p.score,online:p.online,done:p.done,me:p.k===pid}));
-  return {t:"state",st:S,players,me:{answers:(H.roster[pid]&&H.roster[pid].answers)||{}}};
+  return {t:"state",v:VERSION,st:S,players,me:{answers:(H.roster[pid]&&H.roster[pid].answers)||{}}};
 }
 function hostSend(pid){publish(TOPIC+H.code+"/p/"+pid,hostSnapshot(pid));}
 function hostBroadcast(){for(const pid in H.roster){if(H.roster[pid].online)hostSend(pid);}}
@@ -207,7 +208,8 @@ function sendHello(){
 
 function updatePlayerStatus(){
   if(!client||!client.connected)return;
-  if(live())setStatus(true,"В комнате "+P.code);
+  if(live()&&P.hostVersion!==VERSION)setStatus(false,"У ведущего другая версия — обновите страницы");
+  else if(live())setStatus(true,"В комнате "+P.code);
   else if(Date.now()-P.since>NOT_FOUND_MS)setStatus(false,"Ведущий не в сети");
   else setStatus(false,"Ищем комнату…");
 }
@@ -217,6 +219,7 @@ function playerOnData(d){
   const st=d.st;
   if(!(Number.isInteger(st.q)&&st.q>=0&&st.q<QS.length))return;
   S=st;P.lastState=Date.now();
+  P.hostVersion=d.v||0;
   P.players=Array.isArray(d.players)?d.players:[];
   P.answers=(d.me&&d.me.answers)||{};
   if(P.pending&&(P.pending.round!==S.round||P.pending.q!==S.q||P.answers[S.q]))P.pending=null;
@@ -321,6 +324,7 @@ function renderHost(){
           <span class="muted">Отсканируйте QR или откройте ссылку:</span><span class="link">${esc(url)}</span>
         </div>
       </div>
+      <div class="notice">Не закрывайте и не сворачивайте эту вкладку: через неё идёт игра. Ссылку удобнее показать QR-кодом.</div>
       <p class="muted">12 вопросов, по 30 секунд. Правильный ответ даёт 500 очков и до 500 бонусных за скорость.</p>
       <div class="panel"><div class="meta"><span>Игроки в комнате</span><span>${online.length}</span></div>
         <div class="chips" style="margin-top:12px">${ps.length?ps.map(p=>`<span class="chip ${p.online?"":"off"}">${esc(p.name)}</span>`).join(""):'<span class="muted">Пока никого. Первый, кто зайдёт, появится здесь.</span>'}</div></div>
@@ -418,6 +422,13 @@ function tick(){
 setInterval(tick,250);
 
 /* ---------- старт ---------- */
+$("#ver").textContent="Версия "+VERSION;
+/* Свёрнутая вкладка теряет соединение — при возврате переподключаемся сразу. */
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState!=="visible"||!client)return;
+  if(!client.connected)client.reconnect();
+  if(role==="player")sendHello();
+});
 $("#leave").onclick=()=>{if(role==="host")hostClose();else if(role==="player")playerLeave();};
 if(params.get("room"))startPlayer(params.get("room"));
 else render();
