@@ -3,30 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Хайфский Семейный Квиз</title>
+<title>Семейный Квиз</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;900&family=Nunito:wght@500;700;800&display=swap">
-<link rel="stylesheet" href="css/style.css?v=3">
+<link rel="stylesheet" href="css/style.css?v=4">
 </head>
 <body>
 <div id="app">
   <header>
-    <div class="brand"><i aria-hidden="true"></i>Хайфский Квиз</div>
+    <div class="brand"><i aria-hidden="true"></i><span id="brand">Семейный Квиз</span></div>
     <div class="row">
       <span class="status" id="status" hidden><i></i><span></span></span>
       <button type="button" class="btn ghost" id="leave" hidden style="padding:7px 14px;font-size:13px">Выйти</button>
     </div>
   </header>
   <main id="main">
-    <span class="eyebrow">Суржик-иврит спешл · 12 вопросов</span>
-    <h1>Подключаемся к&nbsp;<em>Кармелю</em>…</h1>
+    <h1>Загружаем <em>квиз</em>…</h1>
     <p class="muted">Секунду, загружаем игру.</p>
   </main>
   <footer class="muted" id="ver" style="font-size:12px"></footer>
 </div>
-<script src="js/vendor/mqtt.min.js?v=3"></script>
-<script src="js/vendor/qrcode.min.js?v=3"></script>
-<script src="js/questions.js?v=3"></script>
-<script src="js/app.js?v=3"></script>
+<script src="js/vendor/mqtt.min.js?v=4"></script>
+<script src="js/vendor/qrcode.min.js?v=4"></script>
+<script src="js/questions.js?v=4"></script>
+<script src="js/app.js?v=4"></script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-/* Хайфский квиз — многопользовательская версия.
+/* Семейный квиз (Хайфа, Вена) — многопользовательская версия.
  *
  * Сеть: публичный MQTT-брокер по WebSocket (wss). Все сообщения идут через брокер,
  * прямых соединений между устройствами нет — поэтому работает в любой сети,
@@ -12,7 +12,7 @@
  */
 "use strict";
 
-const VERSION=3;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
+const VERSION=4;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
 const L=["А","Б","В","Г"], TL=30000, NAME_MAX=24;
 const TOPIC="haifa-quiz/v1/";
 const PING_MS=5000, OFFLINE_MS=16000, NOT_FOUND_MS=8000;
@@ -37,6 +37,15 @@ let role=null;        // null (стартовый экран) | "host" | "player
 let client=null;      // MQTT-клиент
 let S=null;           // состояние игры {phase:"lobby"|"question"|"reveal"|"final", q, round, startedAt}
 let lastHTML="", lastView="";
+
+/* ---------- выбор квиза (QUIZZES — в questions.js) ---------- */
+let QUIZ=null, QS=[];
+function useQuiz(id){
+  QUIZ=QUIZZES[id]||QUIZZES.haifa;QS=QUIZ.qs;
+  $("#brand").textContent=QUIZ.brand;
+  document.title=QUIZ.brand;
+}
+function quizId(){for(const k in QUIZZES)if(QUIZZES[k]===QUIZ)return k;return "haifa";}
 
 /* ---------- очки ---------- */
 function pts(i,ans){const a=ans&&ans[i];if(!a||a[0]!==QS[i].a)return 0;return 500+Math.round(500*Math.max(0,1-a[1]/TL));}
@@ -82,8 +91,9 @@ function startHost(resume){
     for(const k in H.roster)H.roster[k].online=false;
   }else{
     H.code=newCode();H.roster={};
-    S={phase:"lobby",q:0,round:newRound(),startedAt:0};
+    S={phase:"lobby",q:0,round:newRound(),startedAt:0,quiz:ls.get("hq-quiz","haifa")};
   }
+  useQuiz(S.quiz);
   setRoomInURL(null);
   $("#leave").hidden=false;
   hostSave();
@@ -146,7 +156,8 @@ function hostSnapshot(pid){
 function hostSend(pid){publish(TOPIC+H.code+"/p/"+pid,hostSnapshot(pid));}
 function hostBroadcast(){for(const pid in H.roster){if(H.roster[pid].online)hostSend(pid);}}
 function hostChanged(){hostSave();hostBroadcast();render();}
-function setState(patch){S=Object.assign({},S,patch);hostChanged();}
+function setState(patch){S=Object.assign({},S,patch);useQuiz(S.quiz);hostChanged();}
+function hostPickQuiz(id){if(S.phase==="lobby"&&QUIZZES[id]){ls.set("hq-quiz",id);setState({quiz:id});}}
 
 function hostStart(){setState({phase:"question",q:0,startedAt:Date.now()});}
 function hostReveal(){if(S.phase==="question")setState({phase:"reveal"});}
@@ -217,7 +228,9 @@ function updatePlayerStatus(){
 function playerOnData(d){
   if(!d||role!=="player"||d.t!=="state"||!d.st||typeof d.st.phase!=="string")return;
   const st=d.st;
-  if(!(Number.isInteger(st.q)&&st.q>=0&&st.q<QS.length))return;
+  const qs=(QUIZZES[st.quiz]||QUIZZES.haifa).qs;
+  if(!(Number.isInteger(st.q)&&st.q>=0&&st.q<qs.length))return;
+  useQuiz(st.quiz);
   S=st;P.lastState=Date.now();
   P.hostVersion=d.v||0;
   P.players=Array.isArray(d.players)?d.players:[];
@@ -275,12 +288,13 @@ function render(){
 function renderHome(){
   if(lastView==="home")return;lastView="home";lastHTML="";
   const saved=ls.get("hq-host",null);
-  $("#main").innerHTML=`<span class="eyebrow">Суржик-иврит спешл · 12 вопросов</span>
-    <h1>Хайфский <em>семейный</em> квиз</h1>
+  $("#brand").textContent="Семейный Квиз";document.title="Семейный Квиз";
+  $("#main").innerHTML=`<span class="eyebrow">${Object.values(QUIZZES).map(z=>esc(z.name)).join(" · ")} · по 12 вопросов</span>
+    <h1>Семейный <em>квиз</em></h1>
     <p class="muted">Ведущий открывает игру на большом экране, игроки отвечают с телефонов.</p>
     <div class="choice">
       <div class="panel"><span class="eyebrow">Я ведущий</span>
-        <p class="muted">Создайте комнату и покажите код или QR игрокам.</p>
+        <p class="muted">Создайте комнату, выберите квиз и покажите код или QR игрокам.</p>
         <button class="btn" id="host-new">Создать комнату</button>
         ${saved&&saved.code?`<button class="btn ghost" id="host-resume">Вернуться в комнату ${esc(saved.code)}</button>`:""}
       </div>
@@ -300,9 +314,9 @@ function boardHTML(list,max){
 }
 function finalHTML(ps){
   const t=ps.slice(0,3);
-  return `<span class="eyebrow">Финал · Кармель взят</span><h1>Итоги <em>квиза</em></h1>
+  return `<span class="eyebrow">${esc(QUIZ.finale)}</span><h1>Итоги <em>квиза</em></h1>
     ${t.length?`<div class="podium">${[1,0,2].map(i=>t[i]?`<div class="p${i+1}"><strong>${i+1}</strong>${esc(t[i].name)}<div class="muted">${t[i].score}</div></div>`:"<span></span>").join("")}</div>`+boardHTML(ps,50)
-      :'<p class="muted">Никто не отвечал с телефона. Кабаны победили.</p>'}`;
+      :`<p class="muted">${esc(QUIZ.empty)}</p>`}`;
 }
 function timeLeft(){
   if(!S||S.phase!=="question")return 0;
@@ -315,8 +329,11 @@ function renderHost(){
   const ps=ranked(hostPlayers()),online=ps.filter(p=>p.online);
   if(S.phase==="lobby"){
     const url=joinURL(H.code);
-    if(setHTML(`<span class="eyebrow">Лобби · ждём игроков</span>
-      <h1>Хайфский <em>семейный</em> квиз</h1>
+    const id=quizId();
+    if(setHTML(`<span class="eyebrow">Лобби · ${esc(QUIZ.eyebrow)}</span>
+      <h1>${QUIZ.title}</h1>
+      <div class="row"><span class="muted">Квиз:</span><div class="seg" id="quiz">${Object.entries(QUIZZES).map(([k,z])=>
+        `<button type="button" data-q="${k}" aria-pressed="${k===id}">${esc(z.name)}</button>`).join("")}</div></div>
       <div class="panel invite">
         <div id="qr" aria-label="QR-код для входа"></div>
         <div style="display:flex;flex-direction:column;gap:8px;min-width:0">
@@ -330,6 +347,7 @@ function renderHost(){
         <div class="chips" style="margin-top:12px">${ps.length?ps.map(p=>`<span class="chip ${p.online?"":"off"}">${esc(p.name)}</span>`).join(""):'<span class="muted">Пока никого. Первый, кто зайдёт, появится здесь.</span>'}</div></div>
       <div class="row"><button class="btn" id="go">Начать игру</button><button class="btn ghost" id="cl">Закрыть комнату</button></div>`)){
       $("#go").onclick=hostStart;$("#cl").onclick=hostClose;
+      $("#quiz").querySelectorAll("button").forEach(b=>b.onclick=()=>hostPickQuiz(b.dataset.q));
       if(window.QRCode)new QRCode($("#qr"),{text:url,width:160,height:160,correctLevel:QRCode.CorrectLevel.M});
       else $("#qr").hidden=true;
     }
@@ -344,7 +362,7 @@ function renderHost(){
   const Q=QS[S.q],rev=S.phase==="reveal";
   const cnt=[0,0,0,0];ps.forEach(p=>{const a=p.answers[S.q];if(a)cnt[a[0]]++;});
   const answered=ps.filter(p=>p.done).length;
-  if(setHTML(`<div class="meta"><span>Вопрос ${S.q+1} из ${QS.length} · ${S.q<6?"Раунд 1":"Раунд 2 · Финальный штурм Кармеля"}</span><span>${rev?"":"Ответили: "+answered+" из "+online.length}</span></div>
+  if(setHTML(`<div class="meta"><span>Вопрос ${S.q+1} из ${QS.length} · ${S.q<6?"Раунд 1":"Раунд 2 · "+esc(QUIZ.round2)}</span><span>${rev?"":"Ответили: "+answered+" из "+online.length}</span></div>
     ${rev?"":'<div class="bar"><i id="tb"></i></div>'}
     <h2>${esc(Q.q)}</h2>
     <div class="grid host">${Q.o.map((o,i)=>`<div class="tile t${i} ${rev?(i===Q.a?"right":"dim"):""}"><b>${L[i]}</b><span>${esc(o)}</span>${rev?`<span class="cnt">${cnt[i]}</span>`:""}</div>`).join("")}</div>
@@ -364,11 +382,11 @@ function renderPlayer(){
   if(!P.name){
     if(lastView==="join")return;lastView="join";lastHTML="";
     m.innerHTML=`<span class="eyebrow">Комната ${esc(P.code)}</span>
-      <h1>Хайфский <em>семейный</em> квиз</h1>
+      <h1>${QUIZ?QUIZ.title:"Семейный <em>квиз</em>"}</h1>
       <p class="muted">Как тебя записать в таблицу лидеров?</p>
       <form id="jf" class="row" style="flex-direction:column;align-items:stretch;max-width:420px">
         <label for="nm" class="eyebrow">Имя или ник</label>
-        <input id="nm" maxlength="${NAME_MAX}" autocomplete="nickname" placeholder="Например, Кабан из Адара">
+        <input id="nm" maxlength="${NAME_MAX}" autocomplete="nickname" placeholder="${esc(QUIZ?QUIZ.placeholder:"Например, Кабан из Адара")}">
         <button class="btn" type="submit">Войти в игру</button></form>`;
     $("#jf").addEventListener("submit",e=>{e.preventDefault();join($("#nm").value)});
     return;
@@ -384,7 +402,7 @@ function renderPlayer(){
     return;
   }
   if(S.phase==="lobby"){
-    if(setHTML(`<span class="eyebrow">Ты в игре · комната ${esc(P.code)}</span><h1>${esc(P.name)}, <em>сядь поудобнее</em></h1>
+    if(setHTML(`<span class="eyebrow">Ты в игре · ${esc(QUIZ.name)} · комната ${esc(P.code)}</span><h1>${esc(P.name)}, <em>сядь поудобнее</em></h1>
       <p class="muted">Вопросы появятся, когда ведущий начнёт.</p>
       <div class="chips">${ps.filter(p=>p.online).map(p=>`<span class="chip ${p.me?"me":""}">${esc(p.name)}</span>`).join("")}</div>
       <div class="row"><button class="btn ghost" id="rn">Сменить имя</button></div>`))bindRename();
