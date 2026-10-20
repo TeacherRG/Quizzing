@@ -1,4 +1,4 @@
-/* Семейный квиз (Хайфа, Вена) — многопользовательская версия.
+/* Семейный квиз (Хайфа, Вена, Днепр) — многопользовательская версия.
  *
  * Сеть: публичный MQTT-брокер по WebSocket (wss). Все сообщения идут через брокер,
  * прямых соединений между устройствами нет — поэтому работает в любой сети,
@@ -15,8 +15,9 @@
  */
 "use strict";
 
-const VERSION=5;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
+const VERSION=6;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
 const TL=30000, NAME_MAX=24;
+const BASE=100, BONUS=900;   // правильный ответ: BASE + до BONUS за скорость (сразу — 1000, в последнюю секунду — около 100)
 const TOPIC="haifa-quiz/v1/";
 const PING_MS=5000, OFFLINE_MS=16000, NOT_FOUND_MS=8000;
 const $=s=>document.querySelector(s);
@@ -83,7 +84,9 @@ function useQuiz(id){
 function quizId(){for(const k in QUIZZES)if(QUIZZES[k]===QUIZ)return k;return DEFAULT_QUIZ;}
 
 /* ---------- очки ---------- */
-function pts(i,ans){const a=ans&&ans[i];if(!a||a[0]!==QS[i].answer)return 0;return 500+Math.round(500*Math.max(0,1-a[1]/TL));}
+function bonus(ms){return Math.round(BONUS*Math.max(0,1-ms/TL));}
+function pts(i,ans){const a=ans&&ans[i];if(!a||a[0]!==QS[i].answer)return 0;return BASE+bonus(a[1]);}
+const secs=ms=>(ms/1000).toFixed(1);
 function counted(i){return !!S&&(S.phase==="final"||i<S.q||(i===S.q&&S.phase==="reveal"));}
 function scoreOf(ans){return QS.reduce((s,_,i)=>s+(counted(i)?pts(i,ans):0),0);}
 function ranked(list){return list.slice().sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name));}
@@ -307,6 +310,46 @@ function playerLeave(){
   goHome();
 }
 
+/* ---------- конфетти ---------- */
+const CONFETTI_COLORS=["#2f80c4","#3c9a5f","#d9932c","#d4584f","#e3b04b","#eaf3f6"];
+let confettiDone="";   // ключ последнего салюта, чтобы перерисовка экрана не запускала его снова
+function confettiOnce(key,big){if(confettiDone===key)return;confettiDone=key;confetti(big);}
+/* big — длинный салют для итогового окна: залпы с двух сторон и дождь сверху. */
+function confetti(big){
+  const cv=document.createElement("canvas");cv.className="confetti";cv.setAttribute("aria-hidden","true");
+  document.body.appendChild(cv);
+  const ctx=cv.getContext("2d"),dpr=Math.min(2,window.devicePixelRatio||1);
+  let W=0,H=0;
+  const size=()=>{W=innerWidth;H=innerHeight;cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);};
+  size();addEventListener("resize",size);
+  const k=Math.max(.6,H/800),parts=[];
+  const add=(n,delay,fn)=>{for(let i=0;i<n;i++)parts.push(Object.assign({rot:Math.random()*6.3,vr:(Math.random()-.5)*.3,
+    w:6+Math.random()*6,h:8+Math.random()*8,c:CONFETTI_COLORS[i%CONFETTI_COLORS.length],t:delay+Math.random()*120},fn()));};
+  const side=left=>()=>({x:left?-10:W+10,y:H*.75,vx:(left?1:-1)*(4+Math.random()*10)*k,vy:-(9+Math.random()*12)*k});
+  const bursts=big?3:1;
+  for(let b=0;b<bursts;b++){add(70,b*900,side(true));add(70,b*900,side(false));}
+  if(big)add(160,300,()=>({x:Math.random()*W,y:-20-Math.random()*H*.5,vx:(Math.random()-.5)*2,vy:1+Math.random()*3,t:300+Math.random()*3500}));
+  const start=performance.now();let last=start;
+  const frame=now=>{
+    const dt=Math.min(3,(now-last)/16.7),el=now-start;last=now;
+    ctx.clearRect(0,0,W,H);
+    let alive=0;
+    for(const p of parts){
+      if(el<p.t){alive++;continue;}
+      p.vy=Math.min(p.vy+.35*k*dt,4*k);p.vx*=Math.pow(.985,dt);
+      p.x+=(p.vx+Math.sin((el+p.t)/300)*.8)*dt;p.y+=p.vy*dt;p.rot+=p.vr*dt;
+      if(p.y>H+20)continue;
+      alive++;
+      ctx.save();ctx.translate(p.x,p.y);ctx.rotate(p.rot);ctx.fillStyle=p.c;
+      ctx.fillRect(-p.w/2,-p.h/2*Math.abs(Math.cos(p.rot*2)),p.w,p.h*Math.abs(Math.cos(p.rot*2)));
+      ctx.restore();
+    }
+    if(alive&&el<12000)requestAnimationFrame(frame);
+    else{removeEventListener("resize",size);cv.remove();}
+  };
+  requestAnimationFrame(frame);
+}
+
 /* =====================================================================
    ОТРИСОВКА
    ===================================================================== */
@@ -378,7 +421,7 @@ function renderHost(){
         </div>
       </div>
       <div class="notice">${t("lobby.keepOpen")}</div>
-      <p class="muted">${t("lobby.rules",{count:QS.length,seconds:TL/1000})}</p>
+      <p class="muted">${t("lobby.rules",{count:QS.length,seconds:TL/1000,base:BASE,max:BASE+BONUS})}</p>
       <div class="panel"><div class="meta"><span>${t("lobby.players")}</span><span>${online.length}</span></div>
         <div class="chips" style="margin-top:12px">${ps.length?ps.map(p=>`<span class="chip ${p.online?"":"off"}">${esc(p.name)}</span>`).join(""):`<span class="muted">${t("lobby.nobody")}</span>`}</div></div>
       <div class="row"><button class="btn" id="go">${t("lobby.start")}</button><button class="btn ghost" id="cl">${t("lobby.close")}</button></div>`)){
@@ -390,6 +433,7 @@ function renderHost(){
     return;
   }
   if(S.phase==="final"){
+    confettiOnce(S.round+":final",true);
     if(setHTML(finalHTML(ps)+`<div class="row"><button class="btn" id="again">${t("final.again")}</button><button class="btn ghost" id="cl">${t("lobby.close")}</button></div>`)){
       $("#again").onclick=hostReset;$("#cl").onclick=hostClose;
     }
@@ -398,12 +442,14 @@ function renderHost(){
   const Q=QS[S.q],rev=S.phase==="reveal";
   const cnt=[0,0,0,0];ps.forEach(p=>{const a=p.answers[S.q];if(a)cnt[a[0]]++;});
   const answered=ps.filter(p=>p.done).length;
+  const fast=ps.filter(p=>p.answers[S.q]&&p.answers[S.q][0]===Q.answer).sort((a,b)=>a.answers[S.q][1]-b.answers[S.q][1])[0];
   const round=S.q<Math.ceil(QS.length/2)?t("game.round1"):t("game.round2",{name:QUIZ.round2});
   if(setHTML(`<div class="meta"><span>${t("game.progress",{n:S.q+1,total:QS.length})} · ${round}</span><span>${rev?"":t("game.answered",{n:answered,total:online.length})}</span></div>
     ${rev?"":'<div class="bar"><i id="tb"></i></div>'}
     <h2>${esc(Q.question)}</h2>
     <div class="grid host">${Q.options.map((o,i)=>`<div class="tile t${i} ${rev?(i===Q.answer?"right":"dim"):""}"><b>${letter(i)}</b><span>${esc(o)}</span>${rev?`<span class="cnt">${cnt[i]}</span>`:""}</div>`).join("")}</div>
     ${rev?`<div class="why"><span class="eyebrow">${t("game.key")}</span><p>${letter(Q.answer)}. ${esc(Q.explanation||"")}</p></div>
+      ${fast?`<p class="muted">${t("game.fastest",{name:fast.name,s:secs(fast.answers[S.q][1]),n:pts(S.q,fast.answers)})}</p>`:""}
       ${ps.length?`<span class="eyebrow">${t("game.leaders")}</span>`+boardHTML(ps,5):""}
       <div class="row"><button class="btn" id="nx">${S.q+1<QS.length?t("game.next"):t("game.results")}</button></div>`
      :`<div class="row"><button class="btn" id="rv">${t("game.reveal")}</button><span class="muted big" id="tn" style="font-size:32px"></span></div>`}
@@ -446,12 +492,14 @@ function renderPlayer(){
       <div class="row"><button class="btn ghost" id="rn">${t("player.rename")}</button></div>`))bindRename();
     return;
   }
-  if(S.phase==="final"){setHTML(finalHTML(ps));return;}
+  if(S.phase==="final"){confettiOnce(S.round+":final",true);setHTML(finalHTML(ps));return;}
   const Q=QS[S.q],my=myAnswer(),rev=S.phase==="reveal";
   if(rev){
     const ok=my&&my[0]===Q.answer,place=ps.findIndex(p=>p.me)+1;
+    if(ok)confettiOnce(S.round+":"+S.q,false);
     setHTML(`<div class="meta"><span>${t("game.progress",{n:S.q+1,total:QS.length})}</span><span>${t("player.points",{n:mine?mine.score:0})}</span></div>
-      <div class="big ${ok?"ok":"bad"}">${ok?"+"+pts(S.q,P.answers):(my?t("player.miss"):t("player.noAnswer"))}</div>
+      <div class="big ${ok?"ok":"bad"}">${ok?"+"+(BASE+bonus(my[1])):(my?t("player.miss"):t("player.noAnswer"))}</div>
+      ${ok?`<p class="muted">${t("player.speed",{s:secs(my[1]),base:BASE,bonus:bonus(my[1])})}</p>`:""}
       <p>${t("player.correct",{letter:letter(Q.answer),text:Q.options[Q.answer]})}</p>
       ${place?`<p class="muted">${t("player.place",{place,total:ps.length})}</p>`:""}`);
     return;
