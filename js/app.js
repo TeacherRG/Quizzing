@@ -15,7 +15,7 @@
  */
 "use strict";
 
-const VERSION=6;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
+const VERSION=7;    // меняйте вместе с ?v= в index.html — так браузер не возьмёт старые файлы из кеша
 const TL=30000, NAME_MAX=24;
 const BASE=100, BONUS=900;   // правильный ответ: BASE + до BONUS за скорость (сразу — 1000, в последнюю секунду — около 100)
 const TOPIC="haifa-quiz/v1/";
